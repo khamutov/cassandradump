@@ -1,4 +1,6 @@
+# coding=utf-8
 import argparse
+from array import array
 import sys
 import itertools
 import codecs
@@ -13,11 +15,19 @@ from cassandra.auth import PlainTextAuthProvider #For protocol_version 2
 from cassandra.cluster import Cluster
 
 TIMEOUT = 120.0
-FETCH_SIZE = 100
+FETCH_SIZE = 2147483647
 DOT_EVERY = 1000
 CONCURRENT_BATCH_SIZE = 1000
 
 args = None
+
+# parsing
+STATE_STATEMENT = 1
+STATE_STRING = 2
+STATE_ESCAPE = 3
+STATE_END_STATEMENT = 4
+
+statement = array('c')
 
 def to_utf8(s):
     return codecs.decode(s, 'utf-8')
@@ -116,42 +126,67 @@ def can_execute_concurrently(statement):
     else:
         return False
 
-
 def import_data(session):
     f = codecs.open(args.import_file, 'r', encoding = 'utf-8')
 
     cnt = 0
 
-    statement = ''
+    statement = array('u')
+    state = STATE_STATEMENT
     concurrent_statements = []
 
     for line in f:
-        statement += line
-        if statement.endswith(";\n"):
-            if can_execute_concurrently(statement):
-                concurrent_statements.append((statement, None))
 
-                if len(concurrent_statements) >= CONCURRENT_BATCH_SIZE:
-                    cassandra.concurrent.execute_concurrent(session, concurrent_statements)
-                    concurrent_statements = []
-            else:
-                if len(concurrent_statements) > 0:
-                    cassandra.concurrent.execute_concurrent(session, concurrent_statements)
-                    concurrent_statements = []
+        #statement += line
 
-                session.execute(statement)
+        for symbol in line:
+            statement.append(symbol)
+            if state == STATE_STATEMENT:
+                if symbol == ';':
+                    state = STATE_END_STATEMENT
 
-            statement = ''
+                    #print(statement.tounicode())
 
-            cnt += 1
-            if (cnt % DOT_EVERY) == 0:
-                log_quiet('.')
+                    if can_execute_concurrently(statement.tounicode()):
+                        concurrent_statements.append((statement.tounicode(), None))
+
+                        if len(concurrent_statements) >= CONCURRENT_BATCH_SIZE:
+                            cassandra.concurrent.execute_concurrent(session, concurrent_statements)
+                            concurrent_statements = []
+                    else:
+                        if len(concurrent_statements) > 0:
+                            cassandra.concurrent.execute_concurrent(session, concurrent_statements)
+                            concurrent_statements = []
+                        try:
+                            session.execute(statement.tounicode())
+                        except cassandra.protocol.SyntaxException:
+                            UTF8Writer = codecs.getwriter('utf8')
+                            sys.stdout = UTF8Writer(sys.stdout)
+                            print(statement.tounicode())
+
+                    cnt += 1
+                    if (cnt % DOT_EVERY) == 0:
+                        log_quiet('.')
+
+                    statement = array('u')
+                    state = STATE_STATEMENT
+                    continue
+                elif symbol == "'":
+                    state = STATE_STRING
+                    continue
+            if state == STATE_STRING:
+                if symbol == '\'':
+                    state = STATE_STATEMENT
+                continue
+            if state == STATE_ESCAPE:
+                state = STATE_STRING
+                continue
 
     if len(concurrent_statements) > 0:
         cassandra.concurrent.execute_concurrent(session, concurrent_statements)
 
-    if statement != '':
-        session.execute(statement)
+    #if statement != '':
+    #    session.execute(statement)
 
     if cnt > DOT_EVERY:
         log_quiet('\n')
@@ -286,6 +321,11 @@ def setup_cluster():
     else:
         nodes = [args.host]
 
+    if args.port is None:
+        port = 9042
+    else:
+        port = args.port
+
     cluster = None
 
     if args.protocol_version is not None and args.username is not None and args.password is not None:
@@ -296,7 +336,7 @@ def setup_cluster():
             ap = PlainTextAuthProvider(username=args.username, password=args.password)
             cluster = Cluster(contact_points=nodes, protocol_version=2, auth_provider=ap, load_balancing_policy=cassandra.policies.WhiteListRoundRobinPolicy(nodes))
     else:
-        cluster = Cluster(contact_points=nodes, load_balancing_policy=cassandra.policies.WhiteListRoundRobinPolicy(nodes))
+        cluster = Cluster(contact_points=nodes, port=port, load_balancing_policy=cassandra.policies.WhiteListRoundRobinPolicy(nodes))
     session = cluster.connect()
 
     session.default_timeout = TIMEOUT
@@ -318,6 +358,7 @@ def main():
     parser.add_argument('--export-file', help='export data to the specified file')
     parser.add_argument('--filter', help='export a slice of a column family according to a CQL filter. This takes essentially a typical SELECT query stripped of the initial "SELECT ... FROM" part (e.g. "system.schema_columns where keyspace_name =\'OpsCenter\'", and exports only that data. Can be specified multiple times', action='append')
     parser.add_argument('--host', help='the address of a Cassandra node in the cluster (localhost if omitted)')
+    parser.add_argument('--port', help='cql port of a Cassandra (9042 if omitted)')
     parser.add_argument('--import-file', help='import data from the specified file')
     parser.add_argument('--keyspace', help='export a keyspace along with all its column families. Can be specified multiple times', action='append')
     parser.add_argument('--no-create', help='don\'t generate create (and drop) statements', action='store_true')
